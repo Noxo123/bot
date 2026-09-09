@@ -1,25 +1,17 @@
 import time
 import threading
-from pathlib import Path
 
 import cv2
 import mss
 import numpy as np
+import pytesseract
 from pynput import keyboard
 from pynput.keyboard import Controller
 from plyer import notification
 
-# ============================================================
-# FiveM Fishing Bot
-# F8 toggles the bot. F10 exits.
-# Put screenshots/templates named Z.png, Q.png, S.png, D.png
-# in templates/ if you want exact key recognition.
-# ============================================================
-
 DELAY_AFTER_DETECTION = 5.0
-SCAN_INTERVAL = 0.08
-MATCH_THRESHOLD = 0.72
-TEMPLATE_DIR = Path(__file__).parent / "templates"
+SCAN_INTERVAL = 0.10
+OCR_SCALE = 3
 
 keyboard_controller = Controller()
 sct = mss.mss()
@@ -28,7 +20,7 @@ exiting = False
 busy = False
 
 
-def notify(title: str, message: str):
+def notify(title, message):
     try:
         notification.notify(title=title, message=message, app_name="Noxo Fishing Bot", timeout=2)
     except Exception:
@@ -36,12 +28,9 @@ def notify(title: str, message: str):
 
 
 def center_region():
-    """Small central region; percentage-based so it works on different resolutions."""
     monitor = sct.monitors[1]
-    width = monitor["width"]
-    height = monitor["height"]
-    region_w = int(width * 0.28)
-    region_h = int(height * 0.22)
+    width, height = monitor["width"], monitor["height"]
+    region_w, region_h = int(width * 0.28), int(height * 0.22)
     return {
         "left": monitor["left"] + (width - region_w) // 2,
         "top": monitor["top"] + (height - region_h) // 2,
@@ -55,71 +44,45 @@ def screenshot(region):
     return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
 
-def load_templates():
-    templates = {}
-    TEMPLATE_DIR.mkdir(exist_ok=True)
-    for key in "ZQSD":
-        path = TEMPLATE_DIR / f"{key}.png"
-        if path.exists():
-            image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-            if image is not None and image.size:
-                templates[key] = image
-    return templates
-
-
-def match_key(frame, templates):
-    """Template matching. Returns (key, score), or (None, 0)."""
-    if not templates:
-        return None, 0.0
-
+def detect_key(frame):
+    """OCR limited strictly to the four possible keys: Z, Q, S, D."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    best_key, best_score = None, 0.0
+    gray = cv2.resize(gray, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
+    variants = [
+        gray,
+        cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+        cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)[1],
+        cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)[1],
+    ]
+    config = "--psm 10 -c tessedit_char_whitelist=ZQSDzqsd"
+    for image in variants:
+        text = pytesseract.image_to_string(image, config=config).upper()
+        for char in text:
+            if char in "ZQSD":
+                return char
+    return None
 
-    for key, template in templates.items():
-        th, tw = template.shape[:2]
-        if gray.shape[0] < th or gray.shape[1] < tw:
-            continue
-        result = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        _, score, _, _ = cv2.minMaxLoc(result)
-        if score > best_score:
-            best_key, best_score = key, float(score)
 
-    if best_score >= MATCH_THRESHOLD:
-        return best_key, best_score
-    return None, best_score
-
-
-def visual_prompt_present(frame):
-    """Fallback detector: detects a bright/high-contrast UI element in the center.
-    It intentionally does not press a key without an exact template match.
-    """
+def prompt_visible(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, threshold = cv2.threshold(gray, 205, 255, cv2.THRESH_BINARY)
-    ratio = cv2.countNonZero(threshold) / threshold.size
-    return 0.002 < ratio < 0.45
+    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    ratio = cv2.countNonZero(binary) / binary.size
+    return 0.001 < ratio < 0.50
 
 
-def wait_until_prompt_disappears(region, templates, timeout=15):
+def wait_until_prompt_disappears(region, timeout=15):
     started = time.monotonic()
-    while running and time.monotonic() - started < timeout:
-        frame = screenshot(region)
-        key, score = match_key(frame, templates)
-        if key is None and not visual_prompt_present(frame):
-            return True
+    while running and not exiting and time.monotonic() - started < timeout:
+        if not prompt_visible(screenshot(region)):
+            return
         time.sleep(SCAN_INTERVAL)
-    return False
 
 
 def worker():
     global busy
     region = center_region()
-    templates = load_templates()
-
-    if templates:
-        notify("Noxo Fishing Bot", f"Prêt — templates chargés : {', '.join(templates)}")
-    else:
-        notify("Noxo Fishing Bot", "Aucun template Z/Q/S/D. Ajoute-les dans templates/")
-
+    notify("Noxo Fishing Bot", "Prêt — OCR direct Z/Q/S/D")
+    last_key = None
     last_detection = 0.0
 
     while not exiting:
@@ -127,17 +90,15 @@ def worker():
             time.sleep(0.15)
             continue
 
-        frame = screenshot(region)
-        key, score = match_key(frame, templates)
-
-        # Debounce: don't repeatedly detect the same UI frame.
+        key = detect_key(screenshot(region))
         now = time.monotonic()
-        if key and now - last_detection > DELAY_AFTER_DETECTION + 0.5:
+        if key and (key != last_key or now - last_detection > DELAY_AFTER_DETECTION + 1):
+            last_key = key
             last_detection = now
             busy = True
-            notify("🎣 Touche détectée", f"{key} — score {score:.2f}. Attente de 5 secondes…")
+            notify("Touche détectée", f"{key} — action dans 5 secondes")
 
-            for remaining in range(5, 0, -1):
+            for _ in range(5):
                 if not running or exiting:
                     break
                 time.sleep(1)
@@ -145,9 +106,8 @@ def worker():
             if running and not exiting:
                 keyboard_controller.press(key.lower())
                 keyboard_controller.release(key.lower())
-                notify("🎣 Pêche", f"Touche {key} envoyée")
-                wait_until_prompt_disappears(region, templates)
-
+                notify("Pêche", f"Touche {key} envoyée")
+                wait_until_prompt_disappears(region)
             busy = False
 
         time.sleep(SCAN_INTERVAL)
@@ -158,7 +118,7 @@ def on_press(key):
     try:
         if key == keyboard.Key.f8:
             running = not running
-            notify("Noxo Fishing Bot", "🟢 Activé" if running else "🔴 Désactivé")
+            notify("Noxo Fishing Bot", "Activé" if running else "Désactivé")
         elif key == keyboard.Key.f10:
             exiting = True
             running = False
@@ -169,14 +129,12 @@ def on_press(key):
 
 
 def main():
-    print("Noxo Fishing Bot")
-    print("F8 = activer/désactiver | F10 = quitter")
-    print("Zone analysée : centre de l'écran")
-    print("Action : attente 5 s puis Z/Q/S/D")
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
+    print("Noxo Fishing Bot - OCR Z/Q/S/D")
+    print("F8 = activer/desactiver | F10 = quitter")
+    print("Détection directe de la lettre au centre de l'écran")
+    print("Action : attente 5 s puis pression de Z/Q/S/D")
+    print("Tesseract OCR doit être installé et accessible dans le PATH.")
+    threading.Thread(target=worker, daemon=True).start()
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
 
