@@ -17,12 +17,13 @@ GREEN = "#45d483"
 RED = "#ff5d6c"
 BLUE = "#5aa7ff"
 
+
 class FishingOverlay:
     def __init__(self, root):
         self.root = root
         self.root.title("Noxo Fishing Bot")
-        self.root.geometry("360x300+40+40")
-        self.root.minsize(320, 260)
+        self.root.geometry("430x390+40+40")
+        self.root.minsize(390, 350)
         self.root.attributes("-topmost", True)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -34,13 +35,18 @@ class FishingOverlay:
         self.last_key = "—"
         self.last_circle = "—"
         self.last_action = "En attente"
+        self.bar_angle = "—"
+        self.blue_state = "—"
+        self.click_count = 0
+        self.key_count = 0
+        self.last_error = "—"
 
         self.build_ui()
         self.start_bot()
-        self.root.after(250, self.refresh_ui)
+        self.root.after(200, self.refresh_ui)
 
     def build_ui(self):
-        header = tk.Frame(self.root, bg=PANEL, height=42)
+        header = tk.Frame(self.root, bg=PANEL, height=44)
         header.pack(fill="x")
         header.pack_propagate(False)
         header.bind("<ButtonPress-1>", self.start_drag)
@@ -58,7 +64,7 @@ class FishingOverlay:
         close.pack(side="right", padx=4)
 
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=12, pady=10)
+        body.pack(fill="both", expand=True, padx=14, pady=10)
 
         self.status_dot = tk.Label(body, text="●", bg=BG, fg=RED, font=("Segoe UI", 14))
         self.status_dot.grid(row=0, column=0, sticky="w")
@@ -67,35 +73,55 @@ class FishingOverlay:
         self.status_label.grid(row=0, column=1, sticky="w")
 
         self.key_label = self.info_row(body, 1, "Touche détectée")
-        self.circle_label = self.info_row(body, 2, "Cercle")
-        self.action_label = self.info_row(body, 3, "Dernière action")
+        self.bar_label = self.info_row(body, 2, "Barre rouge")
+        self.blue_label = self.info_row(body, 3, "Zone bleue")
+        self.circle_label = self.info_row(body, 4, "Anneau")
+        self.action_label = self.info_row(body, 5, "Dernière action")
+        self.stats_label = self.info_row(body, 6, "Statistiques")
+        self.error_label = self.info_row(body, 7, "Erreur")
 
         buttons = tk.Frame(body, bg=BG)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0))
-        buttons.columnconfigure((0, 1, 2), weight=1)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        for col in range(3):
+            buttons.columnconfigure(col, weight=1)
 
         self.make_button(buttons, "ACTIVER", "on", 0, GREEN)
         self.make_button(buttons, "DÉSACTIVER", "off", 1, RED)
         self.make_button(buttons, "TOGGLE", "toggle", 2, BLUE)
 
-        hint = tk.Label(body, text="F8 = activer/désactiver  •  F10 = fermer\nGlisse la barre du haut pour déplacer l'overlay",
-                        bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="center")
-        hint.grid(row=5, column=0, columnspan=2, pady=(14, 0))
+        hint = tk.Label(
+            body,
+            text="F8 = activer/désactiver  •  F10 = fermer\nGlisse la barre du haut pour déplacer l'overlay",
+            bg=BG,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            justify="center",
+        )
+        hint.grid(row=9, column=0, columnspan=2, pady=(10, 0))
 
     def info_row(self, parent, row, name):
         tk.Label(parent, text=name, bg=BG, fg=MUTED,
-                 font=("Segoe UI", 9)).grid(row=row, column=0, sticky="w", pady=4)
+                 font=("Segoe UI", 9)).grid(row=row, column=0, sticky="w", pady=3)
         label = tk.Label(parent, text="—", bg=BG, fg=TEXT,
                          font=("Segoe UI", 9, "bold"))
-        label.grid(row=row, column=1, sticky="e", pady=4)
+        label.grid(row=row, column=1, sticky="e", pady=3)
         parent.columnconfigure(1, weight=1)
         return label
 
     def make_button(self, parent, text, command, col, color):
-        tk.Button(parent, text=text, command=lambda: self.send_command(command),
-                  bg=PANEL, fg=color, activebackground="#232a37", activeforeground=color,
-                  bd=0, relief="flat", font=("Segoe UI", 8, "bold"), pady=7).grid(
-                      row=0, column=col, padx=3, sticky="ew")
+        tk.Button(
+            parent,
+            text=text,
+            command=lambda: self.send_command(command),
+            bg=PANEL,
+            fg=color,
+            activebackground="#232a37",
+            activeforeground=color,
+            bd=0,
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            pady=7,
+        ).grid(row=0, column=col, padx=3, sticky="ew")
 
     def start_drag(self, event):
         self.drag_x = event.x_root - self.root.winfo_x()
@@ -137,10 +163,13 @@ class FishingOverlay:
                 if line:
                     self.parse_line(line)
         except Exception as exc:
-            self.last_action = f"Erreur: {exc}"
+            self.last_error = str(exc)
+            self.last_action = "Erreur de lecture"
 
     def parse_line(self, line):
         upper = line.upper()
+        if "[ERREUR]" in upper or "ÉCHEC" in upper:
+            self.last_error = line
         if "ACTIVÉ" in upper:
             self.running = True
             self.last_action = "Bot activé"
@@ -151,17 +180,21 @@ class FishingOverlay:
             match = re.search(r"TOUCHE\s+([ZQSD])", upper)
             if match:
                 self.last_key = match.group(1)
+                self.key_count += 1
                 self.last_action = f"Touche {self.last_key} détectée"
-        elif "[CERCLE] POSITION DYNAMIQUE" in upper:
-            match = re.search(r"x=(\d+)\s+y=(\d+)\s+r=(\d+)", line)
+        elif "[CERCLE] CENTRE=" in upper:
+            match = re.search(r"CENTRE=\((\d+),(\d+)\)\s+r=(\d+)\s+BARRE=([0-9.]+)°\s+BLEU=(OUI|NON)", upper)
             if match:
                 self.last_circle = f"X {match.group(1)}  Y {match.group(2)}  R {match.group(3)}"
+                self.bar_angle = f"{match.group(4)}°"
+                self.blue_state = match.group(5)
         elif "[CERCLE] CLIC" in upper:
-            self.last_action = "Clic automatique"
+            self.click_count += 1
+            self.last_action = "Clic automatique sur le bleu"
         elif "TOUCHE PRESSÉE" in upper:
-            self.last_action = "Touche envoyée"
-        elif "AUCUN CERCLE" in upper:
-            self.last_action = "Cercle non détecté"
+            self.last_action = "Touche envoyée à Windows"
+        elif "BARRE ROUGE / ZONE BLEUE NON EXPLOITABLE" in upper:
+            self.last_action = "Cible non détectée"
         elif "ARRÊTÉ" in upper:
             self.running = False
             self.last_action = "Bot arrêté"
@@ -174,16 +207,21 @@ class FishingOverlay:
             self.process.stdin.write(command + "\n")
             self.process.stdin.flush()
         except Exception as exc:
-            self.last_action = f"Commande impossible: {exc}"
+            self.last_error = str(exc)
+            self.last_action = "Commande impossible"
 
     def refresh_ui(self):
         active = self.running
         self.status_dot.config(fg=GREEN if active else RED)
         self.status_label.config(text="ACTIVÉ" if active else "DÉSACTIVÉ")
         self.key_label.config(text=self.last_key)
+        self.bar_label.config(text=self.bar_angle)
+        self.blue_label.config(text=self.blue_state)
         self.circle_label.config(text=self.last_circle)
         self.action_label.config(text=self.last_action)
-        self.root.after(250, self.refresh_ui)
+        self.stats_label.config(text=f"Touches {self.key_count}  •  Clics {self.click_count}")
+        self.error_label.config(text=self.last_error)
+        self.root.after(200, self.refresh_ui)
 
     def close(self):
         if self.process and self.process.poll() is None:
@@ -196,6 +234,7 @@ class FishingOverlay:
                 except Exception:
                     pass
         self.root.destroy()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
