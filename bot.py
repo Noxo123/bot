@@ -1,40 +1,47 @@
 import os
+import re
 import time
 import threading
+import ctypes
 from pathlib import Path
 
 import cv2
 import mss
 import numpy as np
 import pytesseract
-from pynput import keyboard, mouse
-from pynput.keyboard import Controller as KeyboardController
+from pynput import keyboard
 from pynput.mouse import Controller as MouseController, Button
 from plyer import notification
 
 # =========================
 # Configuration
 # =========================
-DELAY_AFTER_DETECTION = 5.0
-SCAN_INTERVAL = 0.06
-OCR_SCALE = 3
-OCR_CONFIDENCE = 45
+DELAY_AFTER_DETECTION = 0.0
+SCAN_INTERVAL = 0.035
+OCR_SCALE = 4
+OCR_CONFIDENCE = 35
 REGION_WIDTH_RATIO = 0.28
-REGION_HEIGHT_RATIO = 0.22
+REGION_HEIGHT_RATIO = 0.28
+KEY_REGION_RATIO = 0.13
 ALLOWED_KEYS = "ZQSD"
 
-# Detection dynamique du mini-jeu cercle/bleu.
+# Couleurs du mini-jeu
 BLUE_H_MIN = 90
 BLUE_H_MAX = 140
-BLUE_S_MIN = 70
+BLUE_S_MIN = 65
 BLUE_V_MIN = 45
-CIRCLE_MIN_RADIUS = 5
-CIRCLE_MAX_RADIUS = 100
-CIRCLE_TOLERANCE = 3
-CLICK_COOLDOWN = 0.30
-CIRCLE_REQUIRED_FRAMES = 2
+RED_S_MIN = 100
+RED_V_MIN = 80
 
-keyboard_controller = KeyboardController()
+# Suivi de l'anneau / curseur rouge
+CIRCLE_MIN_RADIUS = 45
+CIRCLE_MAX_RADIUS = 260
+CIRCLE_TOLERANCE = 8
+CLICK_COOLDOWN = 0.22
+CIRCLE_TIMEOUT = 12.0
+RING_BAND_RATIO = 0.22
+
+keyboard_vk = {"Z": 0x5A, "Q": 0x51, "S": 0x53, "D": 0x44}
 mouse_controller = MouseController()
 sct = mss.MSS()
 running = False
@@ -43,6 +50,59 @@ busy = False
 config_lock = threading.Lock()
 
 
+# =========================
+# Windows SendInput
+# =========================
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("u", INPUTUNION),
+    ]
+
+
+KEYEVENTF_KEYUP = 0x0002
+INPUT_KEYBOARD = 1
+
+
+def send_key_windows(key):
+    """Envoie une vraie entrée clavier Windows, plus fiable que pynput pour FiveM."""
+    key = key.upper()
+    vk = keyboard_vk.get(key)
+    if vk is None:
+        return False
+
+    extra = ctypes.c_ulong(0)
+    down = INPUT(
+        type=INPUT_KEYBOARD,
+        ki=KEYBDINPUT(vk, 0, 0, 0, ctypes.pointer(extra)),
+    )
+    up = INPUT(
+        type=INPUT_KEYBOARD,
+        ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, ctypes.pointer(extra)),
+    )
+
+    sent = ctypes.windll.user32.SendInput(2, ctypes.byref(down), ctypes.sizeof(INPUT))
+    return sent == 2
+
+
+# =========================
+# Tesseract / notifications
+# =========================
 def setup_tesseract():
     """Trouve automatiquement tesseract.exe sur Windows."""
     found = []
@@ -88,6 +148,9 @@ def notify(title, message):
         print(f"Notification Windows indisponible: {exc}")
 
 
+# =========================
+# Capture
+# =========================
 def center_region():
     monitor = sct.monitors[1]
     width, height = monitor["width"], monitor["height"]
@@ -107,157 +170,231 @@ def screenshot(region):
     return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
 
+# =========================
+# Détection de la touche centrale
+# =========================
 def detect_key(frame):
-    """Détecte automatiquement Z/Q/S/D avec OCR + score de confiance."""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    """OCR uniquement autour du carré central du mini-jeu."""
+    h, w = frame.shape[:2]
+    rw = max(60, int(w * KEY_REGION_RATIO))
+    rh = max(60, int(h * KEY_REGION_RATIO))
+    x1 = max(0, (w - rw) // 2)
+    y1 = max(0, (h - rh) // 2)
+    roi = frame[y1:y1 + rh, x1:x1 + rw]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
+
     variants = [
         gray,
         cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-        cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)[1],
-        cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)[1],
+        cv2.threshold(gray, 155, 255, cv2.THRESH_BINARY)[1],
+        cv2.threshold(gray, 155, 255, cv2.THRESH_BINARY_INV)[1],
     ]
-    config = "--psm 11 -c tessedit_char_whitelist=ZQSDzqsd"
+
     best_key = None
     best_conf = -1.0
-
     for image in variants:
         try:
             data = pytesseract.image_to_data(
-                image, config=config, output_type=pytesseract.Output.DICT
+                image,
+                config="--psm 10 -c tessedit_char_whitelist=ZQSDzqsd",
+                output_type=pytesseract.Output.DICT,
             )
         except Exception as exc:
             print(f"[OCR] Erreur : {exc}")
             return None
 
         for i, raw_text in enumerate(data.get("text", [])):
-            text = raw_text.strip().upper()
+            text = re.sub(r"[^ZQSD]", "", raw_text.upper())
             if not text:
                 continue
             try:
                 confidence = float(data["conf"][i])
             except (ValueError, TypeError, IndexError):
                 confidence = 0.0
-            for char in text:
-                if char in ALLOWED_KEYS and confidence >= OCR_CONFIDENCE and confidence > best_conf:
-                    best_key = char
-                    best_conf = confidence
+            if confidence >= OCR_CONFIDENCE and confidence > best_conf:
+                best_key = text[0]
+                best_conf = confidence
 
     if best_key:
         print(f"[Détection] Touche {best_key} (confiance {best_conf:.0f}%)")
     return best_key
 
 
-def detect_blue_mask(frame):
-    """Construit un masque HSV pour retrouver la zone bleue, quelle que soit sa position."""
+# =========================
+# Détection couleur
+# =========================
+def color_masks(frame):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower = np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN], dtype=np.uint8)
-    upper = np.array([BLUE_H_MAX, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
+
+    blue = cv2.inRange(
+        hsv,
+        np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN], dtype=np.uint8),
+        np.array([BLUE_H_MAX, 255, 255], dtype=np.uint8),
+    )
+    red1 = cv2.inRange(
+        hsv,
+        np.array([0, RED_S_MIN, RED_V_MIN], dtype=np.uint8),
+        np.array([12, 255, 255], dtype=np.uint8),
+    )
+    red2 = cv2.inRange(
+        hsv,
+        np.array([168, RED_S_MIN, RED_V_MIN], dtype=np.uint8),
+        np.array([179, 255, 255], dtype=np.uint8),
+    )
+    red = cv2.bitwise_or(red1, red2)
+
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
+    blue = cv2.morphologyEx(blue, cv2.MORPH_OPEN, kernel)
+    blue = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, kernel)
+    red = cv2.morphologyEx(red, cv2.MORPH_OPEN, kernel)
+    red = cv2.morphologyEx(red, cv2.MORPH_CLOSE, kernel)
+    return blue, red
 
 
-def detect_circle_in_blue(frame):
-    """Cherche le cercle à sa position actuelle et renvoie (x, y, r, score).
+def find_ring_center(frame, blue_mask, red_mask):
+    """Trouve le centre de l'anneau sans supposer sa position exacte."""
+    h, w = frame.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
 
-    La position n'est jamais fixe : chaque frame est analysée. On privilégie
-    les cercles dont le centre tombe dans la zone bleue et dont le contour
-    contraste avec le bleu.
-    """
-    mask = detect_blue_mask(frame)
-    blue_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not blue_contours:
-        return None
-
-    # On garde les zones bleues suffisamment grandes pour être un élément du mini-jeu.
-    candidates_blue = [c for c in blue_contours if cv2.contourArea(c) >= 80]
-    if not candidates_blue:
-        return None
-    blue_contour = max(candidates_blue, key=cv2.contourArea)
-    bx, by, bw, bh = cv2.boundingRect(blue_contour)
-
-    roi = frame[by:by + bh, bx:bx + bw]
-    if roi.size == 0:
-        return None
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 1.5)
     circles = cv2.HoughCircles(
         gray,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=max(8, CIRCLE_MIN_RADIUS * 2),
-        param1=90,
-        param2=16,
-        minRadius=CIRCLE_MIN_RADIUS,
-        maxRadius=min(CIRCLE_MAX_RADIUS, max(CIRCLE_MIN_RADIUS + 1, min(bw, bh) // 2)),
+        minDist=40,
+        param1=110,
+        param2=26,
+        minRadius=max(CIRCLE_MIN_RADIUS, int(min(w, h) * 0.12)),
+        maxRadius=min(CIRCLE_MAX_RADIUS, int(min(w, h) * 0.48)),
     )
 
-    best = None
-    best_score = -1e9
-    blue_mask_roi = mask[by:by + bh, bx:bx + bw]
+    candidates = []
+    if circles is not None:
+        for cx, cy, r in np.round(circles[0]).astype(int):
+            if 0 <= cx < w and 0 <= cy < h:
+                candidates.append((cx, cy, r))
 
-    if circles is None:
+    if not candidates:
+        # Repli : centre de la zone capturée, puisque le mini-jeu est centré.
+        return w // 2, h // 2, int(min(w, h) * 0.30)
+
+    # Le mini-jeu est généralement proche du centre de la capture.
+    fx, fy = w / 2, h / 2
+    return min(candidates, key=lambda c: abs(c[0] - fx) + abs(c[1] - fy))
+
+
+def ring_points(mask, cx, cy, radius, thickness):
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return np.empty((0, 2), dtype=np.int32)
+    dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+    keep = (dist >= radius - thickness) & (dist <= radius + thickness)
+    return np.column_stack((xs[keep], ys[keep]))
+
+
+def angle_deg(x, y, cx, cy):
+    # 0° = droite, 90° = bas, 180° = gauche, 270° = haut.
+    return (np.degrees(np.arctan2(y - cy, x - cx)) + 360.0) % 360.0
+
+
+def angular_distance(a, b):
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def detect_fishing_target(frame):
+    """Détecte l'anneau, la zone bleue et surtout la barre rouge mobile.
+
+    La décision de clic est basée sur l'angle de la barre rouge par rapport au
+    centre de l'anneau. La zone bleue peut donc être à n'importe quel angle.
+    """
+    blue_mask, red_mask = color_masks(frame)
+    cx, cy, radius = find_ring_center(frame, blue_mask, red_mask)
+    band = max(8, int(radius * RING_BAND_RATIO))
+
+    blue_pts = ring_points(blue_mask, cx, cy, radius, band)
+    red_pts = ring_points(red_mask, cx, cy, radius, band)
+    if len(blue_pts) < 12 or len(red_pts) < 4:
         return None
 
-    for cx, cy, radius in np.round(circles[0]).astype(int):
-        if not (0 <= cx < bw and 0 <= cy < bh):
-            continue
-        global_x, global_y = bx + cx, by + cy
-        inside_blue = blue_mask_roi[cy, cx] > 0
-        if not inside_blue:
-            continue
+    blue_angles = angle_deg(blue_pts[:, 0], blue_pts[:, 1], cx, cy)
+    red_angles = angle_deg(red_pts[:, 0], red_pts[:, 1], cx, cy)
 
-        # Mesure le contraste sur l'anneau du cercle : utile pour éviter de
-        # sélectionner un simple reflet ou une petite tache bleue.
-        yy, xx = np.ogrid[:bh, :bw]
-        dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
-        ring = (dist2 >= max(1, (radius - 2) ** 2)) & (dist2 <= (radius + 2) ** 2)
-        ring_pixels = gray[ring]
-        contrast = float(np.std(ring_pixels)) if ring_pixels.size else 0.0
+    # Histogramme angulaire de la zone bleue. On prend les angles réellement
+    # occupés par le bleu, plutôt qu'une position codée en dur (5h-7h).
+    bins = 72
+    hist, edges = np.histogram(blue_angles, bins=bins, range=(0, 360))
+    threshold = max(2, int(hist.max() * 0.12))
+    blue_bins = np.where(hist >= threshold)[0]
+    if len(blue_bins) == 0:
+        return None
 
-        score = (contrast * 2.0) + min(radius, 30) - (abs(cx - bw / 2) + abs(cy - bh / 2)) * 0.01
-        if score > best_score:
-            best_score = score
-            best = (global_x, global_y, int(radius), score)
+    def in_blue(angle):
+        idx = int(angle // (360 / bins)) % bins
+        nearby = [(idx + d) % bins for d in (-1, 0, 1)]
+        return any(hist[b] >= threshold for b in nearby)
 
-    return best
+    # Médiane robuste de la barre rouge.
+    red_angle = float(np.median(red_angles))
+    inside = in_blue(red_angle)
+
+    # Point de clic : au centre de la barre rouge sur l'anneau.
+    click_radius = max(1, radius)
+    rad = np.radians(red_angle)
+    click_x = int(round(cx + np.cos(rad) * click_radius))
+    click_y = int(round(cy + np.sin(rad) * click_radius))
+
+    blue_density = float(hist[int(red_angle // (360 / bins)) % bins]) / max(1, hist.max())
+    return {
+        "center": (int(cx), int(cy)),
+        "radius": int(radius),
+        "angle": red_angle,
+        "click": (click_x, click_y),
+        "inside_blue": inside,
+        "blue_density": blue_density,
+    }
 
 
-def click_circle(region, circle):
-    """Clique aux coordonnées écran correspondant au cercle détecté."""
-    x, y, radius, score = circle
+# =========================
+# Clic / suivi
+# =========================
+def click_target(region, target):
+    x, y = target["click"]
     screen_x = region["left"] + x
     screen_y = region["top"] + y
     mouse_controller.position = (screen_x, screen_y)
     mouse_controller.click(Button.left, 1)
-    notify("🎯 Cercle détecté", f"Clic automatique : X={screen_x} Y={screen_y}")
-    print(f"[CERCLE] clic X={screen_x} Y={screen_y} r={radius} score={score:.1f}")
+    notify("🎯 Zone bleue", f"Clic automatique X={screen_x} Y={screen_y}")
+    print(
+        f"[CERCLE] clic X={screen_x} Y={screen_y} "
+        f"angle={target['angle']:.1f}° r={target['radius']}"
+    )
 
 
-def wait_for_circle_and_click(region, timeout=15):
-    """Suit le cercle frame par frame et clique dès qu'il est dans le bleu."""
+def wait_for_circle_and_click(region, timeout=CIRCLE_TIMEOUT):
+    """Suit la barre rouge à chaque frame et clique dès qu'elle entre dans le bleu."""
     started = time.monotonic()
-    consecutive = 0
     last_click = 0.0
+    seen = 0
 
     while running and not exiting and time.monotonic() - started < timeout:
         frame = screenshot(region)
-        circle = detect_circle_in_blue(frame)
+        target = detect_fishing_target(frame)
         now = time.monotonic()
 
-        if circle:
-            consecutive += 1
-            print(f"[CERCLE] position dynamique x={circle[0]} y={circle[1]} r={circle[2]}")
-            if consecutive >= CIRCLE_REQUIRED_FRAMES and now - last_click >= CLICK_COOLDOWN:
-                click_circle(region, circle)
-                last_click = now
+        if target:
+            seen += 1
+            cx, cy = target["center"]
+            print(
+                f"[CERCLE] centre=({cx},{cy}) r={target['radius']} "
+                f"barre={target['angle']:.1f}° bleu={'OUI' if target['inside_blue'] else 'NON'}"
+            )
+            if target["inside_blue"] and now - last_click >= CLICK_COOLDOWN:
+                click_target(region, target)
                 return True
         else:
-            consecutive = 0
+            seen = 0
 
         time.sleep(SCAN_INTERVAL)
 
@@ -265,13 +402,11 @@ def wait_for_circle_and_click(region, timeout=15):
 
 
 def prompt_visible(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    ratio = cv2.countNonZero(binary) / binary.size
-    return 0.001 < ratio < 0.50
+    key = detect_key(frame)
+    return key is not None
 
 
-def wait_until_prompt_disappears(region, timeout=15):
+def wait_until_prompt_disappears(region, timeout=4):
     started = time.monotonic()
     while running and not exiting and time.monotonic() - started < timeout:
         if not prompt_visible(screenshot(region)):
@@ -279,6 +414,9 @@ def wait_until_prompt_disappears(region, timeout=15):
         time.sleep(SCAN_INTERVAL)
 
 
+# =========================
+# Worker
+# =========================
 def worker():
     global busy
     notify("Noxo Fishing Bot", "Prêt — F8 pour activer")
@@ -287,14 +425,14 @@ def worker():
 
     while not exiting:
         if not running or busy:
-            time.sleep(0.15)
+            time.sleep(0.08)
             continue
 
         region = center_region()
         key = detect_key(screenshot(region))
         now = time.monotonic()
 
-        if key and (key != last_key or now - last_detection > DELAY_AFTER_DETECTION + 1):
+        if key and (key != last_key or now - last_detection > 1.2):
             last_key = key
             last_detection = now
             busy = True
@@ -303,23 +441,23 @@ def worker():
                 delay = DELAY_AFTER_DETECTION
 
             notify("Touche détectée", f"{key} — pression dans {delay:g} secondes")
-            end = time.monotonic() + delay
-            while time.monotonic() < end:
-                if not running or exiting:
-                    break
-                time.sleep(0.05)
+            if delay > 0:
+                end = time.monotonic() + delay
+                while time.monotonic() < end:
+                    if not running or exiting:
+                        break
+                    time.sleep(0.01)
 
             if running and not exiting:
-                key_to_press = key.lower()
-                keyboard_controller.press(key_to_press)
-                keyboard_controller.release(key_to_press)
-                notify("🎣 Touche pressée", f"La touche {key} a été envoyée")
+                sent = send_key_windows(key)
+                if sent:
+                    notify("🎣 Touche pressée", f"La touche {key} a été envoyée à Windows")
+                else:
+                    notify("⚠️ Touche", f"Échec de l'envoi Windows pour {key}")
 
-                # Après la touche, le mini-jeu peut déplacer le cercle à chaque frame.
-                # On le suit dynamiquement et on clique lorsqu'il est dans le bleu.
                 clicked = wait_for_circle_and_click(region)
                 if not clicked:
-                    print("[CERCLE] Aucun cercle exploitable détecté dans le délai.")
+                    print("[CERCLE] Barre rouge / zone bleue non exploitable dans le délai.")
 
                 wait_until_prompt_disappears(region)
 
@@ -330,6 +468,9 @@ def worker():
     notify("Noxo Fishing Bot", "Arrêté")
 
 
+# =========================
+# Terminal
+# =========================
 def print_help():
     print("""
 ========== COMMANDES ==========
@@ -337,14 +478,14 @@ def print_help():
   on / off             Active / désactive le bot
   toggle               Change l'état du bot
   status               Affiche la configuration actuelle
-  delay <secondes>     Change le délai avant la touche
+  delay <secondes>     Change le délai avant la touche (0 par défaut)
   interval <secondes>  Change la fréquence de scan
   confidence <0-100>   Seuil de confiance OCR
   region <largeur> <hauteur>
                        Taille de la zone centrale en % de l'écran
-  tolerance <pixels>   Tolérance/paramètre de suivi du cercle
-  test                 Teste la détection OCR
-  testcircle           Teste le cercle bleu et affiche sa position
+  tolerance <pixels>   Tolérance de suivi
+  test                 Teste la détection OCR centrale
+  testcircle           Teste anneau + bleu + barre rouge
   notify               Teste une notification Windows
   quit / exit          Ferme le bot
   ===============================
@@ -361,7 +502,8 @@ def print_status():
             f"délai={DELAY_AFTER_DETECTION:g}s | scan={SCAN_INTERVAL:g}s | "
             f"confiance={OCR_CONFIDENCE:g}% | "
             f"zone={REGION_WIDTH_RATIO * 100:g}% x {REGION_HEIGHT_RATIO * 100:g}% | "
-            f"cercle rayon={CIRCLE_MIN_RADIUS}-{CIRCLE_MAX_RADIUS}px | "
+            f"touche-centre={KEY_REGION_RATIO * 100:g}% | "
+            f"anneau={CIRCLE_MIN_RADIUS}-{CIRCLE_MAX_RADIUS}px | "
             f"tolérance={CIRCLE_TOLERANCE}px | touches={ALLOWED_KEYS}"
         )
 
@@ -432,21 +574,21 @@ def terminal_worker():
                     raise ValueError
                 with config_lock:
                     globals()["CIRCLE_TOLERANCE"] = value
-                print(f"[CONFIG] Tolérance cercle = {value:g}px")
+                print(f"[CONFIG] Tolérance = {value:g}px")
             elif cmd == "test":
                 key = detect_key(screenshot(center_region()))
                 print(f"[TEST OCR] Lettre détectée : {key or 'AUCUNE'}")
             elif cmd == "testcircle":
                 region = center_region()
-                circle = detect_circle_in_blue(screenshot(region))
-                if circle:
+                target = detect_fishing_target(screenshot(region))
+                if target:
                     print(
-                        f"[TEST CERCLE] x={circle[0]} y={circle[1]} "
-                        f"r={circle[2]} score={circle[3]:.1f} | "
-                        f"écran=({region['left'] + circle[0]}, {region['top'] + circle[1]})"
+                        f"[TEST CERCLE] centre={target['center']} r={target['radius']} "
+                        f"barre={target['angle']:.1f}° bleu={'OUI' if target['inside_blue'] else 'NON'} "
+                        f"clic={target['click']}"
                     )
                 else:
-                    print("[TEST CERCLE] Aucun cercle dans le bleu détecté.")
+                    print("[TEST CERCLE] Anneau, bleu ou barre rouge non détecté.")
             elif cmd == "notify":
                 notify("Noxo Fishing Bot", "Notification de test OK")
             elif cmd in ("quit", "exit"):
@@ -459,6 +601,9 @@ def terminal_worker():
             print("Valeur invalide. Tape 'help' pour voir la syntaxe.")
 
 
+# =========================
+# Hotkeys / main
+# =========================
 def on_press(key):
     global running, exiting
     try:
@@ -475,8 +620,12 @@ def on_press(key):
 
 
 def main():
-    print("Noxo Fishing Bot — OCR Z/Q/S/D + suivi dynamique du cercle bleu")
+    print("Noxo Fishing Bot — touche centrale + suivi barre rouge / zone bleue")
     print("F8 = activer/desactiver | F10 = quitter")
+
+    if os.name != "nt":
+        print("[ERREUR] Cette version utilise Windows SendInput et nécessite Windows.")
+        return
 
     if not setup_tesseract():
         print("Installe Tesseract ou vérifie son chemin avant de lancer la détection.")
