@@ -14,17 +14,24 @@ SCAN_INTERVAL = 0.10
 OCR_SCALE = 3
 
 keyboard_controller = Controller()
-sct = mss.mss()
+sct = mss.MSS()
 running = False
 exiting = False
 busy = False
 
 
 def notify(title, message):
+    """Envoie une notification Windows et garde un fallback console."""
+    print(f"[{title}] {message}")
     try:
-        notification.notify(title=title, message=message, app_name="Noxo Fishing Bot", timeout=2)
-    except Exception:
-        print(f"[{title}] {message}")
+        notification.notify(
+            title=title,
+            message=message,
+            app_name="Noxo Fishing Bot",
+            timeout=3,
+        )
+    except Exception as exc:
+        print(f"Notification Windows indisponible: {exc}")
 
 
 def center_region():
@@ -45,7 +52,7 @@ def screenshot(region):
 
 
 def detect_key(frame):
-    """OCR limited strictly to the four possible keys: Z, Q, S, D."""
+    """OCR limité strictement aux quatre touches possibles : Z, Q, S, D."""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=OCR_SCALE, fy=OCR_SCALE, interpolation=cv2.INTER_CUBIC)
     variants = [
@@ -55,6 +62,7 @@ def detect_key(frame):
         cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)[1],
     ]
     config = "--psm 10 -c tessedit_char_whitelist=ZQSDzqsd"
+
     for image in variants:
         text = pytesseract.image_to_string(image, config=config).upper()
         for char in text:
@@ -81,7 +89,7 @@ def wait_until_prompt_disappears(region, timeout=15):
 def worker():
     global busy
     region = center_region()
-    notify("Noxo Fishing Bot", "Prêt — OCR direct Z/Q/S/D")
+    notify("Noxo Fishing Bot", "Prêt — F8 pour activer")
     last_key = None
     last_detection = 0.0
 
@@ -92,11 +100,13 @@ def worker():
 
         key = detect_key(screenshot(region))
         now = time.monotonic()
+
         if key and (key != last_key or now - last_detection > DELAY_AFTER_DETECTION + 1):
             last_key = key
             last_detection = now
             busy = True
-            notify("Touche détectée", f"{key} — action dans 5 secondes")
+
+            notify("Touche détectée", f"{key} — pression dans 5 secondes")
 
             for _ in range(5):
                 if not running or exiting:
@@ -104,13 +114,18 @@ def worker():
                 time.sleep(1)
 
             if running and not exiting:
-                keyboard_controller.press(key.lower())
-                keyboard_controller.release(key.lower())
-                notify("Pêche", f"Touche {key} envoyée")
+                key_to_press = key.lower()
+                keyboard_controller.press(key_to_press)
+                keyboard_controller.release(key_to_press)
+
+                # Notification envoyée exactement après l'appui sur la touche.
+                notify("🎣 Touche pressée", f"La touche {key} a été envoyée")
+
                 wait_until_prompt_disappears(region)
+
             busy = False
 
-        time.sleep(SCAN_INTERVAL)
+    notify("Noxo Fishing Bot", "Arrêté")
 
 
 def on_press(key):
@@ -133,7 +148,9 @@ def main():
     print("F8 = activer/desactiver | F10 = quitter")
     print("Détection directe de la lettre au centre de l'écran")
     print("Action : attente 5 s puis pression de Z/Q/S/D")
+    print("Une notification est envoyée après chaque touche pressée.")
     print("Tesseract OCR doit être installé et accessible dans le PATH.")
+
     threading.Thread(target=worker, daemon=True).start()
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
